@@ -342,9 +342,93 @@ Shpping cart Api/
 
 ---
 
-## Local Setup & Container Deployment
+---
 
-### Bare-Metal Setup
+## Containerization & Docker Engine Architecture
+
+The backend is fully containerized using an optimized, lightweight **Alpine Linux** footprint to ensure immutable deployments, minimal security attack surface, and deterministic runtime behavior across environments:
+
+- **Base Image**: `node:alpine3.18`, keeping the final image footprint under 150 MB.
+- **Layer Caching Optimization**: Package manifests (`package*.json`) are copied and installed independently before application source code to take advantage of Docker build layer caching.
+- **Image Hygiene (`.dockerignore`)**: Excludes development artifacts (`node_modules`, `.env`, `.git`, log files) to prevent credential leaks and image bloat.
+
+### Local Docker Commands
+```bash
+# 1. Build local container image
+docker build -t nasif284/gracia-shopping-cart:latest .
+
+# 2. Run isolated container with host port binding & environment injection
+docker run -d \
+  --name shopping-cart-app-container \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  --env-file .env \
+  nasif284/gracia-shopping-cart:latest
+
+# 3. View live runtime container logs
+docker logs -f shopping-cart-app-container
+
+# 4. Graceful container termination
+docker stop shopping-cart-app-container && docker rm shopping-cart-app-container
+```
+
+---
+
+## Automated CI/CD Deployment Pipeline (GitHub Actions)
+
+Production delivery is orchestrated through an automated **Two-Stage Continuous Integration & Continuous Deployment (CI/CD)** pipeline declared in [`.github/workflows/cicd.yml`](.github/workflows/cicd.yml), deploying to a **Self-Hosted EC2 Linux Runner**:
+
+```mermaid
+flowchart LR
+    Dev["Developer Git Push (main)"] --> GHA["GitHub Actions Runner"]
+    
+    subgraph BuildJob ["Job 1: Build & Publish (ubuntu-latest)"]
+        Checkout["Checkout Code (actions/checkout@v4)"]
+        DockerAuth["Authenticate to Docker Hub"]
+        DockerBuild["Build Docker Image (node:alpine3.18)"]
+        DockerPush["Push nasif284/gracia-shopping-cart:latest"]
+    end
+    
+    subgraph DeployJob ["Job 2: Continuous Deployment (self-hosted / EC2)"]
+        EnvInject["Write APP_ENV to /home/ubuntu/.env"]
+        DropOld["Drop Previous Container (docker rm -f)"]
+        PruneStorage["Reclaim Host Storage (docker system prune)"]
+        PullImage["Pull Latest Image from Docker Hub"]
+        RunContainer["Deploy Container (--restart unless-stopped)"]
+    end
+    
+    GHA --> Checkout
+    Checkout --> DockerAuth
+    DockerAuth --> DockerBuild
+    DockerBuild --> DockerPush
+    DockerPush --> EnvInject
+    EnvInject --> DropOld
+    DropOld --> PruneStorage
+    PruneStorage --> PullImage
+    PullImage --> RunContainer
+```
+
+### Pipeline Workflow Breakdown
+
+1. **Trigger Condition**:
+   - Executes automatically on any code commit pushed to the production `main` branch.
+2. **Job 1: `build` (GitHub-Hosted `ubuntu-latest`)**:
+   - **Repository Ingestion**: Clones repository state using `actions/checkout@v4`.
+   - **Registry Authentication**: Logs in to Docker Hub using encrypted repository secrets (`DOCKER_USERNAME`, `DOCKER_PASSWORD`).
+   - **Container Compilation**: Builds the production image tagged as `nasif284/gracia-shopping-cart:latest`.
+   - **Registry Push**: Uploads the immutable image artifact to Docker Hub.
+3. **Job 2: `deploy` (Self-Hosted Runner on AWS EC2)**:
+   - **Dependency Gate**: Configured with `needs: build`, guaranteeing deployments only proceed when image build succeeds.
+   - **Zero-Exposure Secret Provisioning**: Writes production environment variables from encrypted GitHub Secret `${{ secrets.APP_ENV }}` directly into `/home/ubuntu/.env`.
+   - **Safe Container Recycling**: Forcibly removes the deprecated container (`docker rm -f shopping-cart-app-container`).
+   - **Automated Storage Hygiene**: Runs `docker system prune -a -f` to purge dangling image layers and avoid EC2 EBS volume exhaustion.
+   - **Latest Image Ingestion**: Pulls fresh image layers from Docker Hub (`nasif284/gracia-shopping-cart:latest`).
+   - **Zero-Downtime Daemon Execution**: Spawns the container daemonized with host port `8000:8000`, environment binding, and `--restart unless-stopped` crash recovery policy.
+
+---
+
+## Local Development Setup
+
 ```bash
 # 1. Install project dependencies
 npm install
@@ -357,15 +441,3 @@ npm run format
 npm run lint
 ```
 
-### Dockerized Deployment
-```bash
-# Build production Docker image
-docker build -t gratia-cart-api .
-
-# Run container with environment bindings
-docker run -d \
-  --name gratia-api-instance \
-  -p 8000:8000 \
-  --env-file .env \
-  gratia-cart-api
-```
