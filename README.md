@@ -126,18 +126,19 @@ stateDiagram-v2
     ReturnRejected --> Delivered
 ```
 
-#### Deterministic Parent Order Rollup
+#### Deterministic Parent Order Rollup Matrix
 A Mongoose `pre("save")` lifecycle hook evaluates the status vector of all child items to dynamically synthesize the top-level `orderStatus`:
-$$\text{orderStatus} = \begin{cases} 
-\text{"Failed"}, & \text{if } \forall i, s_i = \text{"Failed"} \\
-\text{"Cancelled"}, & \text{if } \forall i, s_i = \text{"Cancelled"} \\
-\text{"Return Approved"}, & \text{if } \forall i, s_i = \text{"Return Approved"} \\
-\text{"Completed"}, & \text{if } \forall i, s_i = \text{"Delivered"} \\
-\text{"Partially Delivered"}, & \text{if } \exists i, s_i = \text{"Delivered"} \land \exists j, s_j \neq \text{"Delivered"} \\
-\text{"Partially Shipped"}, & \text{if } \exists i, s_i \in \{\text{"Shipped"}, \text{"Out for Delivery"}\} \\
-\text{"Processing"}, & \text{if } \exists i, s_i = \text{"Processing"} \\
-\text{"Confirmed"}, & \text{otherwise}
-\end{cases}$$
+
+| Target Parent `orderStatus` | Child Line Items Condition | Priority / Precedence |
+| :--- | :--- | :--- |
+| **`"Failed"`** | All items have `status === "Failed"` | 1 (Payment failure) |
+| **`"Cancelled"`** | All items have `status === "Cancelled"` | 2 (Full cancellation) |
+| **`"Return Approved"`** | All items have `status === "Return Approved"` | 3 (Full return) |
+| **`"Completed"`** | All items have `status === "Delivered"` | 4 (Full delivery) |
+| **`"Partially Delivered"`** | At least one item is `"Delivered"` while others are pending | 5 (Split fulfillment) |
+| **`"Partially Shipped"`** | Any item is in `"Shipped"` or `"Out for Delivery"` | 6 (In-transit split) |
+| **`"Processing"`** | Any item is `"Processing"` | 7 (Warehouse queue) |
+| **`"Confirmed"`** | Default state when order items are placed and verified | 8 (Initial state) |
 
 ---
 
@@ -178,8 +179,8 @@ flowchart TD
 ---
 
 ### 6. Real-Time Socket.io Session Registry & Instant Forced Logout
-The backend maintains an in-memory session mapping table:
-$$\text{onlineUsers} : \text{Map}\langle \text{UserId}, \text{SocketId} \rangle$$
+The backend maintains an in-memory session registry mapping active users to WebSocket connections:
+- **Registry Structure**: `onlineUsers: Map<UserId, SocketId>`
 - **Immediate Administrative Revocation**: When an administrator blocks a compromised or abusive user via `/api/admin/users/block/:id`, the server updates the database, sends a security notification email, immediately inspects `onlineUsers`, and dispatches a high-priority `forceLogout` event to the target socket.
 - **Zero-Latency Invalidation**: The client immediately purges local session tokens and terminates execution without waiting for access token expiration.
 
