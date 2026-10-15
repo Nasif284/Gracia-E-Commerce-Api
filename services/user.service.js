@@ -14,6 +14,7 @@ import { GoogleGenAI } from "@google/genai";
 import sendEmail from "../config/emailService.js";
 import OtpModel from "../models/otpModel.js";
 import couponModel from "../models/coupon.model.js";
+import categoryModel from "../models/category.model.js";
 import { generateReferralCode } from "../utils/generateReferralCode.js";
 const ai = new GoogleGenAI({ apiKey: process.env.AI_KEY });
 cloudinary.config({
@@ -238,52 +239,159 @@ export const facebookAuthService = async (user) => {
 
 export const chatService = async (body, userId) => {
   const { query } = body;
+  if (!query || typeof query !== "string") {
+    return "Hello! How can I help you find the perfect product today?";
+  }
 
   let contextData = "";
 
-  const user = await userModel.findById(userId);
-  if (user) {
-    contextData += `User Info: Name is ${user.name}, Email is ${user.email}. `;
-  } else {
-    contextData += "User Info: No specific user information available. ";
+  if (userId) {
+    const user = await userModel.findById(userId).select("name email");
+    if (user) {
+      contextData += `Customer Name: ${user.name}. `;
+    }
   }
-  const products = await productModel
-    .find({
-      name: { $regex: query, $options: "i" },
-    })
-    .populate("variants")
-    .limit(5);
+
+  // 1. Natural language intent analysis & keyword extraction
+  const wantsTopRated = /better|best|top|highest|rated|quality|premium|recommend|suggest|favorite|popular/i.test(query);
+  const wantsBudget = /cheap|affordable|budget|low price|inexpensive|deal|discount|sale|offer/i.test(query);
+
+  const stopWords = new Set([
+    "a", "an", "the", "in", "on", "at", "for", "to", "of", "with", "by", "from",
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "they",
+    "what", "which", "who", "whom", "this", "that", "these", "those",
+    "can", "could", "would", "should", "will", "shall", "may", "might", "must",
+    "better", "best", "good", "great", "nice", "top", "cheap", "expensive",
+    "show", "me", "looking", "find", "get", "suggest", "recommend", "give", "tell",
+    "any", "some", "product", "products", "item", "items", "store", "buy", "shop",
+    "please", "help", "need", "want", "like", "how", "much"
+  ]);
+
+  const cleanQuery = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
+  const tokens = cleanQuery.split(/\s+/).filter(Boolean);
+  const keywords = tokens.filter((w) => !stopWords.has(w) && w.length >= 2);
+
+  // 2. Query products using multiple strategies
+  let products = [];
+  const baseFilter = { isUnlisted: { $ne: true } };
+
+  // Check matching categories by keywords
+  let matchingCategoryIds = [];
+  if (keywords.length > 0) {
+    const categoryMatches = await categoryModel.find({
+      name: { $in: keywords.map((kw) => new RegExp(kw, "i")) },
+      isBlocked: false,
+    }).select("_id");
+    matchingCategoryIds = categoryMatches.map((c) => c._id);
+  }
+
+  // Strategy A: Search with extracted keywords across fields & categories
+  if (keywords.length > 0) {
+    const orConditions = [
+      ...keywords.map((kw) => ({ name: { $regex: kw, $options: "i" } })),
+      ...keywords.map((kw) => ({ tags: { $in: [new RegExp(kw, "i")] } })),
+      ...keywords.map((kw) => ({ brand: { $regex: kw, $options: "i" } })),
+      ...keywords.map((kw) => ({ description: { $regex: kw, $options: "i" } })),
+    ];
+
+    if (matchingCategoryIds.length > 0) {
+      orConditions.push(
+        { categoryId: { $in: matchingCategoryIds } },
+        { subCategoryId: { $in: matchingCategoryIds } },
+        { thirdSubCategoryId: { $in: matchingCategoryIds } }
+      );
+    }
+
+    let sortOption = { rating: -1, dateCreated: -1 };
+    if (wantsBudget) {
+      sortOption = { discount: -1, dateCreated: -1 };
+    } else if (wantsTopRated) {
+      sortOption = { rating: -1, reviewCount: -1 };
+    }
+
+    products = await productModel
+      .find({
+        ...baseFilter,
+        $or: orConditions,
+      })
+      .populate("variants")
+      .sort(sortOption)
+      .limit(6);
+  }
+
+  // Strategy B: If no keyword results, try full query regex on name
+  if (products.length === 0) {
+    products = await productModel
+      .find({
+        ...baseFilter,
+        name: { $regex: query.trim(), $options: "i" },
+      })
+      .populate("variants")
+      .limit(5);
+  }
+
+  // Strategy C: If still 0 products, get top-rated / featured products so AI can offer alternatives
+  let isFallback = false;
+  if (products.length === 0) {
+    isFallback = true;
+    products = await productModel
+      .find(baseFilter)
+      .populate("variants")
+      .sort({ rating: -1, isFeatured: -1 })
+      .limit(5);
+  }
 
   if (products.length > 0) {
-    const productDetails = products.map((p) => `${p.name} price: ₹${p.variants[0].price})`);
-    contextData += `Available Products matching your query: ${productDetails.join(", ")}. `;
+    const productDetails = products.map((p) => {
+      const activeVariant = p.variants?.find((v) => !v.isUnlisted) || p.variants?.[0];
+      const price = activeVariant?.price ? `₹${activeVariant.price}` : "Price on catalog";
+      const rating = p.rating ? `${p.rating}/5` : "4.5/5";
+      const brand = p.brand ? `by ${p.brand}` : "";
+      const discount = p.discount ? ` (${p.discount}% OFF)` : "";
+      return `- **${p.name}** ${brand} | Price: ${price}${discount} | Rating: ★ ${rating}\n  Description: ${p.description?.slice(0, 120) || "Top quality product"}`;
+    }).join("\n");
+
+    if (isFallback) {
+      contextData += `Note: No direct matches found for "${query}". Here are our store's top-rated popular products to recommend instead:\n${productDetails}\n`;
+    } else {
+      contextData += `Available matching products in our store:\n${productDetails}\n`;
+    }
   } else {
-    contextData += "No products found matching your query. ";
+    contextData += "No products currently available in inventory.";
   }
 
   const aiPrompt = `
-    You are an E-commerce Assistant for our online store.
-    Your goal is to help users find products and answer their questions related to our products and services.
-    Do not provide general knowledge or engage in off-topic conversations.
-    Stick to information related to the provided context and user queries.
+You are the personal AI Shopping Stylist and Assistant for "Gratia", a modern online fashion and lifestyle store.
+Your goal is to help shoppers find great products, recommend the best matches, and provide a delightful shopping experience.
 
-    Context:
-    ${contextData}
+Customer Context:
+${contextData}
 
-    User Query:
-    ${query}
+Customer Inquiry:
+"${query}"
 
-    Based on the above information, please provide a concise and helpful e-commerce-related response.
+Guidelines for your response:
+1. Recommend 2 to 3 relevant products directly from the provided catalog context whenever available.
+2. For each recommendation, highlight the product name in **bold**, state its price in ₹, mention its rating, and give a brief 1-sentence reason why it's a great choice.
+3. If the user asks for a "better" or "best" product (e.g. "better shirt"), understand they want high quality, top-rated, or stylish options. Recommend our highest-rated items enthusiastically.
+4. Keep the response friendly, concise, stylish, and engaging.
+5. NEVER respond with a cold list of interrogation questions. If needed, suggest products first, then end with one natural, helpful follow-up question (e.g., "Would you like to see casual styles or formal options?").
+6. Always format using clean markdown: use **bold** for names, bullet points for lists, and clean paragraph breaks.
   `;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: aiPrompt,
-  });
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: aiPrompt,
+    });
 
-  const reply = response.text;
-
-  return reply;
+    return response.text || "I'm here to help! Could you tell me more about what style or product you're looking for?";
+  } catch (err) {
+    console.error("Gemini API error in chatService:", err);
+    return "I am currently having a moment, but I'd love to help you browse our latest collections! Please check our fashion and footwear categories or try asking again.";
+  }
 };
 
 export const userImageUploadService = async (userId, image) => {
