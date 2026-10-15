@@ -20,6 +20,7 @@ import http from "http";
 import qs from "qs";
 import { SocketInit } from "./config/socketIo.js";
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 app.use(nocache());
 app.use(
